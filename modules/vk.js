@@ -563,6 +563,9 @@ class VKBridge {
         const post = (obj && obj.post) ? obj.post : obj
 
         logger.info(`VK wall_post_new: post_id=${post.id}, post_type=${post.post_type}, from_id=${post.from_id}`)
+          
+
+
 
         // Пост опубликован нами — пропускаем (нет петли TG→VK→TG)
         if (this.processedVkPosts.has(String(post.id))) {

@@ -20,6 +20,37 @@ class SuggestionsManager {
         this.lastUserChannels = new Map() // Храним последний выбранный канал для каждого пользователя
     }
 
+    // ─────────────────────────────────────────────
+    // ИСПРАВЛЕНИЕ: блокируем пересылку одобренного поста в ВК через channel_post.
+    // После того как approveSuggestion отправил пост в TG-канал, Telegram вернёт
+    // channel_post событие, которое handleTelegramChannelPost захочет отправить в ВК.
+    // Но _postSuggestionToVk уже занимается публикацией в ВК — двойная отправка не нужна.
+    // Регистрируем message_id / media_group_id в processedTgPosts каждого bridge, чтобы
+    // handleTelegramChannelPost / handleTelegramMediaGroup пропустили эти сообщения.
+    // ─────────────────────────────────────────────
+    _blockApprovalFromVkForward(chatId, sentResult) {
+        if (!sentResult || !this.vkBridges.length) return
+        const msgs = Array.isArray(sentResult) ? sentResult : [sentResult]
+        for (const bridge of this.vkBridges) {
+            for (const msg of msgs) {
+                if (msg && msg.message_id) {
+                    const key = `tg_${chatId}_${msg.message_id}`
+                    bridge.processedTgPosts.add(key)
+                    setTimeout(() => bridge.processedTgPosts.delete(key), 120000)
+                    logger.info(`_blockApprovalFromVkForward: blocked key=${key}`)
+                }
+            }
+            // Для медиагрупп блокируем ещё и по media_group_id
+            const withGroup = msgs.find(m => m && m.media_group_id)
+            if (withGroup) {
+                const key = `tg_${chatId}_group_${withGroup.media_group_id}`
+                bridge.processedTgPosts.add(key)
+                setTimeout(() => bridge.processedTgPosts.delete(key), 120000)
+                logger.info(`_blockApprovalFromVkForward: blocked media_group key=${key}`)
+            }
+        }
+    }
+
     // Исправляем метод handleForwardToMainAdmin
     async handleForwardToMainAdmin(callbackQuery) {
             try {
@@ -652,6 +683,9 @@ class SuggestionsManager {
             // Гайд для ВКонтакте (без HTML)
             const vkGuide = `Если ты хочешь, чтобы новость попала в Подслушку, пролистай вверх и нажми на кнопку "Предложить новость"`;
 
+            // ── Отправляем в TG-канал и сразу блокируем пересылку в ВК через channel_post ──
+            let sentResult = null
+
             if (suggestion.content_type === "album" && suggestion.file_ids) {
                 const parsedMedia = this._parseFileIds(suggestion.file_ids)
                 const media = parsedMedia.map((item, idx) => ({
@@ -660,19 +694,23 @@ class SuggestionsManager {
                     caption: idx === 0 ? textToSend : undefined,
                     parse_mode: "HTML"
                 }));
-                await this.bot.sendMediaGroup(suggestion.chat_id, media);
+                sentResult = await this.bot.sendMediaGroup(suggestion.chat_id, media);
             } else if (suggestion.content_type === "text") {
-                await this.bot.sendMessage(suggestion.chat_id, textToSend, {
+                sentResult = await this.bot.sendMessage(suggestion.chat_id, textToSend, {
                     parse_mode: "HTML",
                 });
             } else {
-                await this.bot.copyMessage(
+                sentResult = await this.bot.copyMessage(
                     suggestion.chat_id,
                     suggestion.original_chat_id,
                     suggestion.original_message_id,
                     { caption: textToSend, parse_mode: "HTML" }
                 );
             }
+
+            // ИСПРАВЛЕНИЕ: блокируем channel_post → handleTelegramChannelPost для этого поста,
+            // чтобы он не улетел в ВК второй раз (первый раз — через _postSuggestionToVk ниже)
+            this._blockApprovalFromVkForward(suggestion.chat_id, sentResult)
 
             await db.updateSuggestionStatus(suggestion.id, "approved");
 
@@ -700,6 +738,9 @@ class SuggestionsManager {
 
     async approveSuggestion(suggestion, channel, callbackQuery) {
         try {
+            // ── Отправляем в TG-канал и сразу блокируем пересылку в ВК через channel_post ──
+            let sentResult = null
+
             if (suggestion.content_type === "album" && suggestion.file_ids) {
                 const parsedMedia = this._parseFileIds(suggestion.file_ids)
                 const media = parsedMedia.map((item, idx) => ({
@@ -707,17 +748,21 @@ class SuggestionsManager {
                     media: item.media,
                     caption: idx === 0 ? suggestion.caption || "" : undefined
                 }));
-                await this.bot.sendMediaGroup(suggestion.chat_id, media);
+                sentResult = await this.bot.sendMediaGroup(suggestion.chat_id, media);
             } else if (suggestion.content_type === "text") {
-                await this.bot.sendMessage(suggestion.chat_id, suggestion.caption || "");
+                sentResult = await this.bot.sendMessage(suggestion.chat_id, suggestion.caption || "");
             } else {
-                await this.bot.copyMessage(
+                sentResult = await this.bot.copyMessage(
                     suggestion.chat_id,
                     suggestion.original_chat_id,
                     suggestion.original_message_id,
                     { caption: suggestion.caption || "" }
                 );
             }
+
+            // ИСПРАВЛЕНИЕ: блокируем channel_post → handleTelegramChannelPost для этого поста,
+            // чтобы он не улетел в ВК второй раз (первый раз — через _postSuggestionToVk ниже)
+            this._blockApprovalFromVkForward(suggestion.chat_id, sentResult)
 
             await db.updateSuggestionStatus(suggestion.id, "approved");
 
