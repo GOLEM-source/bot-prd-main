@@ -29,6 +29,7 @@ class VKBridge {
     // Дедупликация
     this.processedVkPosts = new Set()
     this.processedTgPosts = new Set()
+    this._pendingWallPost = false  // флаг: прямо сейчас выполняется wall.post от бота
 
     // Предложения из ВК, ожидающие решения
     this.pendingVkSuggestions = new Map()
@@ -281,16 +282,22 @@ class VKBridge {
       }
       if (attachments.length > 0) params.attachments = attachments.join(",")
 
+      // Устанавливаем временный флаг ДО wall.post, чтобы успеть заблокировать
+      // Long Poll раньше, чем придёт событие wall_post_new (race condition)
+      const tempKey = dedupeKey || `wall_post_tmp_${Date.now()}`
+      this._pendingWallPost = true
+
       const result = await this.vkApi("wall.post", params)
+
+      this._pendingWallPost = false
+
+      // Всегда блокируем вернувшийся post_id — независимо от dedupeKey
+      this.processedVkPosts.add(String(result.post_id))
+      setTimeout(() => this.processedVkPosts.delete(String(result.post_id)), 10 * 60 * 1000)
 
       if (dedupeKey) {
         this.processedTgPosts.add(dedupeKey)
-        // Пометить VK post чтобы Long Poll не вернул его в TG
-        this.processedVkPosts.add(String(result.post_id))
-        setTimeout(() => {
-          this.processedTgPosts.delete(dedupeKey)
-          this.processedVkPosts.delete(String(result.post_id))
-        }, 10 * 60 * 1000)
+        setTimeout(() => this.processedTgPosts.delete(dedupeKey), 10 * 60 * 1000)
       }
 
       this._stats.vkPosts++
@@ -570,6 +577,15 @@ class VKBridge {
         // Пост опубликован нами — пропускаем (нет петли TG→VK→TG)
         if (this.processedVkPosts.has(String(post.id))) {
           logger.info(`VK Long Poll: skip own post id=${post.id}`)
+          return
+        }
+
+        // Race condition guard: если прямо сейчас идёт wall.post от бота,
+        // этот пост почти наверняка наш — добавляем в processedVkPosts и пропускаем
+        if (this._pendingWallPost) {
+          logger.info(`VK Long Poll: wall_post_new id=${post.id} arrived while wall.post in flight — marking as own, skip`)
+          this.processedVkPosts.add(String(post.id))
+          setTimeout(() => this.processedVkPosts.delete(String(post.id)), 10 * 60 * 1000)
           return
         }
 
