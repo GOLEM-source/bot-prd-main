@@ -18,15 +18,13 @@ class SuggestionsManager {
         this.mediaGroupCache = new Map()
         this.cancelMessages = new Map()
         this.lastUserChannels = new Map() // Храним последний выбранный канал для каждого пользователя
+        
+        // ИСПРАВЛЕНИЕ: Мьютекс/Лок в памяти для предотвращения одновременной обработки (защита от двойного клика)
+        this.processingSuggestions = new Set() 
     }
 
     // ─────────────────────────────────────────────
-    // ИСПРАВЛЕНИЕ: блокируем пересылку одобренного поста в ВК через channel_post.
-    // После того как approveSuggestion отправил пост в TG-канал, Telegram вернёт
-    // channel_post событие, которое handleTelegramChannelPost захочет отправить в ВК.
-    // Но _postSuggestionToVk уже занимается публикацией в ВК — двойная отправка не нужна.
-    // Регистрируем message_id / media_group_id в processedTgPosts каждого bridge, чтобы
-    // handleTelegramChannelPost / handleTelegramMediaGroup пропустили эти сообщения.
+    // Блокировка пересылки одобренного поста в ВК через channel_post.
     // ─────────────────────────────────────────────
     _blockApprovalFromVkForward(chatId, sentResult) {
         if (!sentResult || !this.vkBridges.length) return
@@ -51,36 +49,36 @@ class SuggestionsManager {
         }
     }
 
-    // Исправляем метод handleForwardToMainAdmin
+    // ИСПРАВЛЕНИЕ: Полное восстановление метода handleForwardToMainAdmin без заглушек
     async handleForwardToMainAdmin(callbackQuery) {
-            try {
-                const data = callbackQuery.data;
-                const parts = data.split("_");
-                const suggestionId = parts[4]; // Используем тот же индекс
+        try {
+            const data = callbackQuery.data;
+            const parts = data.split("_");
+            const suggestionId = parts[4]; 
 
-                const suggestion = await db.getSuggestion(suggestionId);
+            const suggestion = await db.getSuggestion(suggestionId);
 
-                if (!suggestion) {
-                    await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Предложение не найдено" });
-                    return;
-                }
-
-                // ... остальной код без изменений
-
+            if (!suggestion) {
+                await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Предложение не найдено" });
+                return;
+            }
 
             // Отправляем сообщение пользователю
             try {
                 await this.bot.sendMessage(
                     suggestion.user_id,
-                    "Поэтому вопросу обращайтесь к главному админу @ktozachemi",
+                    "По этому вопросу обращайтесь к главному админу @ktozachemi",
                     { reply_to_message_id: suggestion.original_message_id }
                 );
             } catch (error) {
                 await this.bot.sendMessage(
                     suggestion.user_id,
-                    "Поэтому вопросу обращайтесь к главному админу @ktozachemi"
+                    "По этому вопросу обращайтесь к главному админу @ktozachemi"
                 );
             }
+
+            // Обновляем статус в базе данных
+            await db.updateSuggestionStatus(suggestionId, "forwarded");
 
             // Обновляем статус в админском чате
             await this.bot.editMessageReplyMarkup(
@@ -89,13 +87,11 @@ class SuggestionsManager {
             );
 
             await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Пользователь направлен к главному админу!" });
-            } catch (error) {
-                logger.error("Error forwarding to main admin:", error);
-                await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Ошибка при выполнении действия" });
-            }
+        } catch (error) {
+            logger.error("Error forwarding to main admin:", error);
+            await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Ошибка при выполнении действия" });
+        }
     }
-
-
 
     async handleStartForSuggestions(msg, channelId) {
         try {
@@ -103,7 +99,6 @@ class SuggestionsManager {
             const chatId = msg.chat.id
             const fullChannelId = `-${channelId}`
 
-            // Сохраняем последний выбранный канал пользователя
             this.lastUserChannels.set(userId, fullChannelId)
 
             this.userStates.set(userId, {
@@ -144,7 +139,6 @@ class SuggestionsManager {
         }
     }
 
-    // Новый метод: обработка команды /mysuggest
     async handleMySuggestCommand(msg) {
         try {
             const userId = msg.from.id
@@ -186,7 +180,6 @@ class SuggestionsManager {
                     disable_web_page_preview: true
                 }
             )
-
         } catch (error) {
             logger.error("Error handling /mysuggest command:", error)
         }
@@ -196,23 +189,19 @@ class SuggestionsManager {
         try {
             const userId = msg.from.id
 
-            // Проверяем бан
             const isBanned = await db.isUserBanned(userId)
             if (isBanned) {
                 await this.bot.sendMessage(msg.chat.id, "🚫 Вы заблокированы и не можете отправлять предложения.")
                 return
             }
 
-            // Проверяем, есть ли сохраненный канал для пользователя
             const lastChannelId = this.lastUserChannels.get(userId)
 
-            // Если есть сохраненный канал, используем его
             if (lastChannelId) {
                 const channels = await db.getChannels()
                 const channel = channels.find((ch) => ch.chat_id === lastChannelId)
 
                 if (channel && channel.suggestions_enabled) {
-                    // Создаем временную сессию для обработки сообщения
                     this.userStates.set(userId, {
                         action: "waiting_suggestion",
                         targetChannelId: lastChannelId,
@@ -223,7 +212,6 @@ class SuggestionsManager {
 
             const userState = this.userStates.get(userId)
             if (!userState || userState.action !== "waiting_suggestion") {
-                // Если нет активной сессии и нет сохраненного канала
                 if (!lastChannelId) {
                     await this.bot.sendMessage(
                         msg.chat.id,
@@ -268,7 +256,6 @@ class SuggestionsManager {
         }
     }
 
-    // Остальные методы остаются без изменений
     async handleSuggestion(msg) {
         try {
             const userId = msg.from.id
@@ -312,7 +299,6 @@ class SuggestionsManager {
 
     async _forwardSingleSuggestion(msg, userId, username, chatId, channel) {
         const contentType = this._getContentType(msg)
-
         if (msg.text === "/start") return
 
         const suggestionId = await db.addSuggestion(
@@ -352,10 +338,7 @@ class SuggestionsManager {
         this.userStates.delete(userId)
         const cancelMessageId = this.cancelMessages.get(userId)
         if (cancelMessageId) {
-            try {
-                await this.bot.deleteMessage(msg.chat.id, cancelMessageId)
-            } catch (error) {
-            }
+            try { await this.bot.deleteMessage(msg.chat.id, cancelMessageId) } catch (error) {}
             this.cancelMessages.delete(userId)
         }
 
@@ -366,7 +349,6 @@ class SuggestionsManager {
 
     async _forwardPrivateSingleSuggestion(msg, userId, username, channel) {
         const contentType = this._getContentType(msg)
-
         if (msg.text === "/start" || msg.text === "/mysuggest") return
 
         const suggestionId = await db.addSuggestion(
@@ -400,10 +382,7 @@ class SuggestionsManager {
 
         const cancelMessageId = this.cancelMessages.get(userId)
         if (cancelMessageId) {
-            try {
-                await this.bot.deleteMessage(msg.chat.id, cancelMessageId)
-            } catch (error) {
-            }
+            try { await this.bot.deleteMessage(msg.chat.id, cancelMessageId) } catch (error) {}
             this.cancelMessages.delete(userId)
         }
 
@@ -425,13 +404,9 @@ class SuggestionsManager {
 
             const cancelMessageId = this.cancelMessages.get(userId)
             if (cancelMessageId) {
-                try {
-                    await this.bot.deleteMessage(chatId, cancelMessageId)
-                } catch (error) {
-                }
+                try { await this.bot.deleteMessage(chatId, cancelMessageId) } catch (error) {}
                 this.cancelMessages.delete(userId)
             }
-
             await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Предложение отменено" })
         } catch (error) {
             logger.error("Error handling cancel suggestion:", error)
@@ -454,8 +429,6 @@ class SuggestionsManager {
             .filter(Boolean)
 
         const userText = messages[0].caption || ""
-
-        // Сохраняем file_id вместе с типом: "type:file_id"
         const fileIdsWithType = media.map(m => m.type + ":" + m.media)
 
         const suggestionId = await db.addSuggestion(
@@ -506,100 +479,146 @@ class SuggestionsManager {
         }
     }
 
+    // ИСПРАВЛЕНИЕ: Полный рефакторинг роутера инлайн-кликов с устранением багов и локов дублирования
     async handleSuggestionAction(callbackQuery) {
         try {
             const data = callbackQuery.data;
-            console.log("Callback data:", data);
-            const channels = await db.getChannels();
+            console.log("Callback data received:", data);
 
+            if (data === "noop") {
+                await this.bot.answerCallbackQuery(callbackQuery.id);
+                return;
+            }
+
+            // ИСПРАВЛЕНИЕ: Выносим обработку разбана вверх, чтобы регулярные сплиты не ломали логику
+            if (data.startsWith("unban_bot_")) {
+                const targetUserId = data.split("_")[2];
+                if (db.unbanUser) {
+                    await db.unbanUser(targetUserId);
+                }
+                await this.bot.editMessageReplyMarkup(
+                    { inline_keyboard: [[{ text: "🔓 АВТОР РАЗБАНЕН", callback_data: "noop" }]] },
+                    { chat_id: callbackQuery.message.chat.id, message_id: callbackQuery.message.message_id }
+                );
+                await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Пользователь разбанен в боте!" });
+                return;
+            }
+
+            const channels = await db.getChannels();
+            let suggestionId = null;
+            let action = null;
+            let channelIdFromButton = null;
+
+            // Точный разбор callback данных
             if (data.startsWith("approve_guide_")) {
                 const parts = data.split("_");
-                console.log("Approve guide parts:", parts);
-                const suggestionId = parts[2];
-                const channelIdFromButton = parts[3];
-
-                const suggestion = await db.getSuggestion(suggestionId);
-                if (!suggestion) {
-                    await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Предложение не найдено" });
-                    return;
-                }
-
-                const channel = channels.find(ch => {
-                    const chId = ch.chat_id.startsWith('-') ? ch.chat_id.slice(1) : ch.chat_id;
-                    return chId === channelIdFromButton;
-                });
-
-                if (!channel) {
-                    await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Канал для предложения не найден!" });
-                    return;
-                }
-
-                await this.approveSuggestionWithGuide(suggestion, channel, callbackQuery);
-                return;
-            }
-
-            // Обработка forward_to_main_admin
-            if (data.startsWith("forward_to_main_admin_")) {
+                suggestionId = parts[2];
+                channelIdFromButton = parts[3];
+                action = "approve_guide";
+            } else if (data.startsWith("forward_to_main_admin_")) {
                 const parts = data.split("_");
-                console.log("Parts:", parts);
-                const suggestionId = parts[4];
-                console.log("Suggestion ID:", suggestionId);
+                suggestionId = parts[4];
+                action = "forward_to_main_admin";
+            } else {
+                const parts = data.split("_");
+                action = parts[0];
+                suggestionId = parts[1];
+            }
 
-                const suggestion = await db.getSuggestion(suggestionId);
-                console.log("Found suggestion:", suggestion);
+            if (!suggestionId) return;
 
-                if (!suggestion) {
-                    await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Предложение не найдено" });
-                    return;
-                }
-
-                await this.handleForwardToMainAdmin(callbackQuery);
+            // ИСПРАВЛЕНИЕ: Защита от дребезга / двойного клика (In-Memory Lock)
+            if (this.processingSuggestions.has(suggestionId)) {
+                await this.bot.answerCallbackQuery(callbackQuery.id, { text: "⏳ Запрос уже обрабатывается, подождите..." });
                 return;
             }
 
-            // Обработка остальных действий (approve, reject, ban)
-            const [action, suggestionId] = data.split("_");
             const suggestion = await db.getSuggestion(suggestionId);
             if (!suggestion) {
                 await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Предложение не найдено" });
                 return;
             }
 
-            const channel = channels.find(ch => {
-                const chId = ch.chat_id.startsWith('-') ? ch.chat_id.slice(1) : ch.chat_id;
-                const sugId = suggestion.chat_id.startsWith('-') ? suggestion.chat_id.slice(1) : suggestion.chat_id;
-                return chId === sugId;
-            });
+            // ИСПРАВЛЕНИЕ: Проверка статуса (если пост уже одобрен/отклонен, не шлем дубль)
+            if (suggestion.status !== "pending") {
+                await this.bot.answerCallbackQuery(callbackQuery.id, { text: `Действие отменено. Статус поста уже: ${suggestion.status}` });
+                
+                let label = "ОБРАБОТАНО";
+                if (suggestion.status === "approved") label = "✅ УЖЕ ОДОБРЕНО";
+                if (suggestion.status === "rejected") label = "❌ УЖЕ ОТКЛОНЕНО";
+                if (suggestion.status === "banned") label = "🚫 АВТОР В БАНЕ";
 
-            if (!channel) {
-                await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Канал для предложения не найден!" });
+                try {
+                    await this.bot.editMessageReplyMarkup(
+                        { inline_keyboard: [[{ text: label, callback_data: "noop" }]] },
+                        { chat_id: callbackQuery.message.chat.id, message_id: callbackQuery.message.message_id }
+                    );
+                } catch (e) {}
                 return;
             }
 
-            switch (action) {
-                case "approve":
-                    await this.approveSuggestion(suggestion, channel, callbackQuery);
-                    break;
-                case "reject":
-                    await this.rejectSuggestion(suggestion, callbackQuery);
-                    break;
-                case "ban":
-                    await this.banSuggestionAuthor(suggestion, channel, callbackQuery);
-                    break;
-            }
+            // Активируем лок на время выполнения
+            this.processingSuggestions.add(suggestionId);
 
+            try {
+                if (action === "approve_guide") {
+                    const channel = channels.find(ch => {
+                        const chId = ch.chat_id.startsWith('-') ? ch.chat_id.slice(1) : ch.chat_id;
+                        return chId === channelIdFromButton;
+                    });
+                    if (!channel) {
+                        await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Канал не найден!" });
+                        return;
+                    }
+                    await this.approveSuggestionWithGuide(suggestion, channel, callbackQuery);
+                    return;
+                }
+
+                if (action === "forward_to_main_admin") {
+                    await this.handleForwardToMainAdmin(callbackQuery);
+                    return;
+                }
+
+                const channel = channels.find(ch => {
+                    const chId = ch.chat_id.startsWith('-') ? ch.chat_id.slice(1) : ch.chat_id;
+                    const sugId = suggestion.chat_id.startsWith('-') ? suggestion.chat_id.slice(1) : suggestion.chat_id;
+                    return chId === sugId;
+                });
+
+                if (!channel && (action === "approve" || action === "ban")) {
+                    await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Целевой канал не найден в БД!" });
+                    return;
+                }
+
+                switch (action) {
+                    case "approve":
+                        await this.approveSuggestion(suggestion, channel, callbackQuery);
+                        break;
+                    case "rejected": // Поддержка вариаций именования кнопок
+                    case "reject":
+                        await this.rejectSuggestion(suggestion, callbackQuery);
+                        break;
+                    case "ban":
+                        await this.banSuggestionAuthor(suggestion, channel, callbackQuery);
+                        break;
+                    default:
+                        await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Неизвестное действие кнопки" });
+                }
+            } finally {
+                // ИСПРАВЛЕНИЕ: Обязательно снимаем лок при любом результате
+                this.processingSuggestions.delete(suggestionId);
+            }
         } catch (error) {
             console.error("Error handling suggestion action:", error);
-            await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Произошла ошибка" });
+            await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Произошла критическая ошибка" });
         }
     }
 
-    // Отправить одобренное предложение в ВК
+    // ИСПРАВЛЕНИЕ: Умная маршрутизация в ВК без слепого дублирования во все паблики
     async _postSuggestionToVk(suggestion, extraText = "") {
         if (!this.vkBridges || this.vkBridges.length === 0) return
         try {
-            // Находим правильный VK bridge по vk_group_id канала
-            let bridge = this.vkBridge  // fallback на первый
+            let bridge = null
             if (suggestion.chat_id) {
                 const channels = await db.getChannels()
                 const channel = channels.find(ch => {
@@ -611,13 +630,25 @@ class SuggestionsManager {
                     const matched = this.vkBridges.find(b => String(b.vkGroupId) === String(channel.vk_group_id))
                     if (matched) {
                         bridge = matched
-                        logger.info(`_postSuggestionToVk: routing suggestion #${suggestion.id} to VK group ${bridge.vkGroupId} (channel: ${channel.title || channel.username})`)
+                        logger.info(`_postSuggestionToVk: routing suggestion #${suggestion.id} to VK group ${bridge.vkGroupId}`)
                     } else {
-                        logger.warn(`_postSuggestionToVk: no VK bridge found for group ${channel.vk_group_id}, using default`)
+                        logger.warn(`_postSuggestionToVk: no VK bridge found for group ${channel.vk_group_id}`)
                     }
+                } else {
+                    logger.info(`_postSuggestionToVk: Канал ${suggestion.chat_id} не привязан к ВК. Кросс-постинг отменен.`);
                 }
             }
-            if (!bridge) return
+
+            // Корректный fallback: если мостов несколько, не спамим в первый попавшийся наугад
+            if (!bridge) {
+                if (this.vkBridges.length === 1) {
+                    bridge = this.vkBridges[0];
+                } else {
+                    logger.warn(`_postSuggestionToVk: Не удалось определить целевую группу ВК для поста #${suggestion.id}. Публикация отменена во избежание спама.`);
+                    return;
+                }
+            }
+
             const text = (suggestion.caption || "") + (extraText ? "\n\n" + extraText : "")
             const photoBuffers = []
 
@@ -626,7 +657,7 @@ class SuggestionsManager {
                 for (const item of parsedMedia) {
                     try {
                         const fileInfo = await this.bot.getFile(item.media)
-                        const fileUrl = `https://api.telegram.org/file/bot${require("../config/config").botToken}/${fileInfo.file_path}`
+                        const fileUrl = `https://api.telegram.org/file/bot${config.botToken}/${fileInfo.file_path}`
                         const buffer = await bridge.downloadFile(fileUrl)
                         const isVideo = item.type === "video"
                         photoBuffers.push({ buffer, filename: isVideo ? "video.mp4" : "photo.jpg", type: item.type })
@@ -636,16 +667,14 @@ class SuggestionsManager {
                 }
             } else if (suggestion.content_type === "photo" && suggestion.original_message_id && suggestion.original_chat_id) {
                 try {
-                    // Получаем file_id из оригинального сообщения через forwardMessage trick
-                    const fwd = await this.bot.forwardMessage(require("../config/config").adminChatId, suggestion.original_chat_id, suggestion.original_message_id)
+                    const fwd = await this.bot.forwardMessage(config.adminChatId, suggestion.original_chat_id, suggestion.original_message_id)
                     if (fwd.photo) {
                         const photo = fwd.photo[fwd.photo.length - 1]
                         const fileInfo = await this.bot.getFile(photo.file_id)
-                        const fileUrl = `https://api.telegram.org/file/bot${require("../config/config").botToken}/${fileInfo.file_path}`
+                        const fileUrl = `https://api.telegram.org/file/bot${config.botToken}/${fileInfo.file_path}`
                         const buffer = await bridge.downloadFile(fileUrl)
                         photoBuffers.push({ buffer, filename: "photo.jpg" })
-                        // Удаляем пересланное сообщение
-                        try { await this.bot.deleteMessage(require("../config/config").adminChatId, fwd.message_id) } catch(e) {}
+                        try { await this.bot.deleteMessage(config.adminChatId, fwd.message_id) } catch(e) {}
                     }
                 } catch (e) {
                     logger.error("_postSuggestionToVk: error forwarding photo:", e)
@@ -667,7 +696,7 @@ class SuggestionsManager {
                 const [type, ...rest] = f.split(":")
                 return { type, media: rest.join(":") }
             }
-            return { type: "photo", media: f }  // backward compat
+            return { type: "photo", media: f }
         })
     }
 
@@ -676,14 +705,10 @@ class SuggestionsManager {
             const cleanChannelId = channel.chat_id.startsWith('-') ? channel.chat_id.slice(1) : channel.chat_id;
             const suggestLink = `https://t.me/${config.botName}?start=${cleanChannelId}_channel`;
 
-            // Гайд для Telegram канала (с HTML-ссылкой)
             const tgGuide = `\n\n📒 Хочешь чтобы твое сообщение попало в канал, пиши <a href="${suggestLink}">сюда</a>\n Эту ссылку так же можно найти в описании канала`;
             const textToSend = (suggestion.caption || "") + tgGuide;
-
-            // Гайд для ВКонтакте (без HTML)
             const vkGuide = `Если ты хочешь, чтобы новость попала в Подслушку, пролистай вверх и нажми на кнопку "Предложить новость"`;
 
-            // ── Отправляем в TG-канал и сразу блокируем пересылку в ВК через channel_post ──
             let sentResult = null
 
             if (suggestion.content_type === "album" && suggestion.file_ids) {
@@ -696,9 +721,7 @@ class SuggestionsManager {
                 }));
                 sentResult = await this.bot.sendMediaGroup(suggestion.chat_id, media);
             } else if (suggestion.content_type === "text") {
-                sentResult = await this.bot.sendMessage(suggestion.chat_id, textToSend, {
-                    parse_mode: "HTML",
-                });
+                sentResult = await this.bot.sendMessage(suggestion.chat_id, textToSend, { parse_mode: "HTML" });
             } else {
                 sentResult = await this.bot.copyMessage(
                     suggestion.chat_id,
@@ -708,10 +731,7 @@ class SuggestionsManager {
                 );
             }
 
-            // ИСПРАВЛЕНИЕ: блокируем channel_post → handleTelegramChannelPost для этого поста,
-            // чтобы он не улетел в ВК второй раз (первый раз — через _postSuggestionToVk ниже)
             this._blockApprovalFromVkForward(suggestion.chat_id, sentResult)
-
             await db.updateSuggestionStatus(suggestion.id, "approved");
 
             await this.bot.editMessageReplyMarkup(
@@ -724,10 +744,9 @@ class SuggestionsManager {
                     reply_to_message_id: suggestion.original_message_id
                 });
             } catch(error) {
-                await this.bot.sendMessage(suggestion.user_id, "✅ Ваше предложение было одобрено и опубликовано!");
+                try { await this.bot.sendMessage(suggestion.user_id, "✅ Ваше предложение было одобрено и опубликовано!"); } catch(e) {}
             }
 
-            // Публикуем в ВК с гайдом для ВК
             await this._postSuggestionToVk(suggestion, vkGuide)
             await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Предложение одобрено с гайдом!" });
         } catch (error) {
@@ -738,7 +757,6 @@ class SuggestionsManager {
 
     async approveSuggestion(suggestion, channel, callbackQuery) {
         try {
-            // ── Отправляем в TG-канал и сразу блокируем пересылку в ВК через channel_post ──
             let sentResult = null
 
             if (suggestion.content_type === "album" && suggestion.file_ids) {
@@ -760,10 +778,7 @@ class SuggestionsManager {
                 );
             }
 
-            // ИСПРАВЛЕНИЕ: блокируем channel_post → handleTelegramChannelPost для этого поста,
-            // чтобы он не улетел в ВК второй раз (первый раз — через _postSuggestionToVk ниже)
             this._blockApprovalFromVkForward(suggestion.chat_id, sentResult)
-
             await db.updateSuggestionStatus(suggestion.id, "approved");
 
             await this.bot.editMessageReplyMarkup(
@@ -776,10 +791,9 @@ class SuggestionsManager {
                     reply_to_message_id: suggestion.original_message_id
                 });
             } catch(error) {
-                await this.bot.sendMessage(suggestion.user_id, "✅ Ваше предложение было одобрено и опубликовано!");
+                try { await this.bot.sendMessage(suggestion.user_id, "✅ Ваше предложение было одобрено и опубликовано!"); } catch(e) {}
             }
 
-            // Публикуем в ВК
             await this._postSuggestionToVk(suggestion)
             await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Предложение одобрено!" });
         } catch (error) {
@@ -802,7 +816,7 @@ class SuggestionsManager {
                     reply_to_message_id: suggestion.original_message_id
                 });
             } catch(error) {
-                await this.bot.sendMessage(suggestion.user_id, "❌ Ваше предложение было отклонено администрацией.");
+                try { await this.bot.sendMessage(suggestion.user_id, "❌ Ваше предложение было отклонено администрацией."); } catch(e) {}
             }
 
             await this.bot.answerCallbackQuery(callbackQuery.id, { text: "Предложение отклонено!" });
@@ -814,7 +828,6 @@ class SuggestionsManager {
 
     async banSuggestionAuthor(suggestion, channel, callbackQuery) {
         try {
-            // Баним пользователя в боте (через БД) — он больше не сможет писать боту
             const usernameToSave = suggestion.username ? suggestion.username.replace("@", "").toLowerCase() : null
             await db.banUser(suggestion.user_id, usernameToSave);
             await db.updateSuggestionStatus(suggestion.id, "banned");
@@ -829,9 +842,8 @@ class SuggestionsManager {
                     suggestion.user_id,
                     `🚫 Вы заблокированы и больше не можете отправлять предложения.`
                 );
-            } catch (error) { /* пользователь мог заблокировать бота */ }
+            } catch (error) { /* Пользователь мог заблокировать бота */ }
 
-            // Кнопка разбана в сообщении админа
             try {
                 await this.bot.editMessageReplyMarkup(
                     {
