@@ -401,18 +401,20 @@ class VKBridge {
     try {
       if (!msgs || msgs.length === 0) return
 
-      // Сортируем по message_id чтобы порядок был правильным
+      // Сортируем по message_id чтобы порядок медиафайлов был правильным
       msgs.sort((a, b) => a.message_id - b.message_id)
 
       const firstMsg = msgs[0]
+      
+      // ✅ Формат ключа верный. Изменяем логику дедупликации и увеличиваем таймаут до 2 минут
       const postKey = `tg_${firstMsg.chat.id}_group_${firstMsg.media_group_id}`
 
       if (this.processedTgPosts.has(postKey)) {
-        logger.info(`TG->VK: media group duplicate, skip`)
+        logger.info(`TG->VK: [Дедупликация] Альбом из предложки уже обработан, пропускаем: ${postKey}`)
         return
       }
       this.processedTgPosts.add(postKey)
-      setTimeout(() => this.processedTgPosts.delete(postKey), 60 * 1000)
+      setTimeout(() => this.processedTgPosts.delete(postKey), 120000) // 2 минуты для надежности
 
       const text = firstMsg.caption || ""
       const photoBuffers = []
@@ -466,13 +468,15 @@ class VKBridge {
       logger.info(`TG->VK: msg fields: ${Object.keys(msg).join(",")}`)
       logger.info(`TG->VK: has_photo=${!!msg.photo}, has_document=${!!msg.document}, media_group=${msg.media_group_id || "none"}`)
       if (msg.photo) logger.info(`TG->VK: photo sizes count=${msg.photo.length}, largest file_id=${msg.photo[msg.photo.length-1].file_id}`)
+      
+      // ✅ Новая логика дедупликации одиночных постов (таймаут 2 минуты)
       const postKey = `tg_${msg.chat.id}_${msg.message_id}`
       if (this.processedTgPosts.has(postKey)) {
-        logger.info(`TG->VK: duplicate, skip`)
+        logger.info(`TG->VK: [Дедупликация] Одиночный пост из предложки уже обработан, пропускаем: ${postKey}`)
         return
       }
       this.processedTgPosts.add(postKey)
-      setTimeout(() => this.processedTgPosts.delete(postKey), 60 * 1000)
+      setTimeout(() => this.processedTgPosts.delete(postKey), 120000)
 
       const text = msg.text || msg.caption || ""
       const photoBuffers = []
